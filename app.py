@@ -3,11 +3,17 @@ app.py - Streamlit front end for the churn model trained by train.py
 
 Run train.py first, then:
     streamlit run app.py
+
+If the saved model cannot be unpickled (e.g. it was written by a different
+scikit-learn / XGBoost version), the app rebuilds it from scratch by calling
+train.py and re-saves it to models/ before rendering the dashboard.
 """
 
 from __future__ import annotations
 
 import json
+import sys
+import traceback
 from pathlib import Path
 
 import joblib
@@ -22,6 +28,10 @@ HERE = Path(__file__).resolve().parent
 MODELS_DIR = HERE / "models"
 MODEL_PATH = MODELS_DIR / "churn_model.joblib"
 META_PATH = MODELS_DIR / "feature_metadata.json"
+
+# train.py must be importable no matter which directory streamlit was started from.
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 
 st.set_page_config(page_title="Customer Churn Predictor", page_icon="📉", layout="wide")
 
@@ -55,14 +65,113 @@ FALLBACK_RANGES = {
 }
 
 
+# Does the installed toolchain match the one that produced the pickle?  A major
+# version bump in scikit-learn or XGBoost is the usual cause of an unpickle error.
+REBUILD_MSG = "Rebuilding the model with the versions installed here."
+
+
+def _describe_load_error(exc: BaseException) -> str:
+    """Turn a pickle/version failure into one readable line."""
+    name = type(exc).__name__
+    text = str(exc) or "no further detail"
+    if len(text) > 300:
+        text = text[:300] + "..."
+    return f"{name}: {text}"
+
+
+def _rebuild_model() -> tuple[object, dict]:
+    """Retrain from train.py and reload whatever it saved into models/.
+
+    train.py exposes build_and_save(), which runs the full clean -> split ->
+    fit -> save sequence and returns the fitted pipeline. We prefer that
+    in-process return value, and fall back to reading the files it wrote.
+    """
+    import train as train_module  # local module; no side effects on import
+
+    # Import-time sanity check so a broken train.py is reported clearly.
+    if not hasattr(train_module, "build_and_save"):
+        raise RuntimeError(
+            "train.py does not expose build_and_save(). Update train.py to the "
+            "version that returns the fitted pipeline."
+        )
+
+    result = train_module.build_and_save(data_path=None, output_dir=MODELS_DIR)
+
+    # build_and_save may return (model, meta) or just the model, depending on
+    # how it was wired up. Accept both.
+    if isinstance(result, tuple) and len(result) == 2:
+        model, meta = result
+    else:
+        model, meta = result, None
+
+    if model is None and MODEL_PATH.exists():
+        model = joblib.load(MODEL_PATH)
+
+    if meta is None:
+        meta = (
+            json.loads(META_PATH.read_text(encoding="utf-8"))
+            if META_PATH.exists()
+            else {}
+        )
+
+    if model is None:
+        raise RuntimeError(
+            "train.py finished but produced no usable model and no "
+            f"{MODEL_PATH.name} was written."
+        )
+
+    return model, meta
+
+
 @st.cache_resource(show_spinner=False)
 def load_artifacts():
-    """Load model + metadata once per session."""
-    if not MODEL_PATH.exists():
-        return None, None
-    model = joblib.load(MODEL_PATH)
-    meta = json.loads(META_PATH.read_text(encoding="utf-8")) if META_PATH.exists() else {}
-    return model, meta
+    """Load model + metadata, self-healing if the pickle cannot be read.
+
+    Returns (model, meta, notice) where notice is a dict describing a rebuild
+    that happened, or describing why one was not possible.
+    """
+    # --- normal path: read the saved artifacts ----------------------------
+    if MODEL_PATH.exists():
+        try:
+            model = joblib.load(MODEL_PATH)
+            meta = (
+                json.loads(META_PATH.read_text(encoding="utf-8"))
+                if META_PATH.exists()
+                else {}
+            )
+            return model, meta, None
+        except Exception as exc:  # unpickling: version, class or file corruption
+            reason = _describe_load_error(exc)
+
+            # --- recovery path: rebuild via train.py ---------------------
+            try:
+                model, meta = _rebuild_model()
+                return model, meta, {
+                    "status": "rebuilt",
+                    "reason": reason,
+                    "detail": traceback.format_exc(limit=3),
+                }
+            except Exception as rebuild_exc:
+                return None, None, {
+                    "status": "failed",
+                    "reason": reason,
+                    "detail": f"{type(rebuild_exc).__name__}: {rebuild_exc}",
+                }
+
+    # --- no file at all: train from scratch ------------------------------
+    try:
+        model, meta = _rebuild_model()
+        return model, meta, {
+            "status": "rebuilt",
+            "reason": f"no saved model found at {MODEL_PATH}",
+            "detail": "",
+        }
+    except Exception as rebuild_exc:
+        return None, None, {
+            "status": "failed",
+            "reason": f"no saved model found at {MODEL_PATH}",
+            "detail": f"{type(rebuild_exc).__name__}: {rebuild_exc}",
+        }
 
 
 def risk_band(p: float) -> tuple[str, str]:
@@ -84,13 +193,30 @@ def per_customer_contributions(clf, row_matrix: np.ndarray, n_features: int) -> 
 
 
 # ---------------------------------------------------------------- sidebar ---
-model, meta = load_artifacts()
+with st.spinner("Loading the churn model..."):
+    model, meta, load_notice = load_artifacts()
 
 st.title("📉 Customer Churn Predictor")
 st.caption("XGBoost model trained by `train.py` on the Telco Churn schema.")
 
+if load_notice and load_notice["status"] == "rebuilt":
+    st.info(
+        "The saved model could not be loaded, so it was **retrained from scratch** "
+        f"with the versions installed here and saved to `{MODEL_PATH.name}`.\n\n"
+        f"_Reason: {load_notice['reason']}_"
+    )
+    with st.expander("Rebuild details"):
+        st.code(load_notice.get("detail") or "no detail", language="text")
+
 if model is None:
-    st.error("No model found. Run `python train.py` first, then reload this page.")
+    st.error("Could not load or rebuild the model.")
+    st.markdown(f"**Why it failed:** {load_notice['reason'] if load_notice else 'unknown'}")
+    if load_notice and load_notice.get("detail"):
+        with st.expander("Error details"):
+            st.code(load_notice["detail"], language="text")
+    st.markdown(
+        "Try running `python train.py` from the project root, then reload this page."
+    )
     st.stop()
 
 options = meta.get("options", FALLBACK_OPTIONS)
