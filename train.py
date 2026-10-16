@@ -223,20 +223,37 @@ def build_preprocessor(cat_cols: list[str], num_cols: list[str]) -> ColumnTransf
 
 
 # --------------------------------------------------------------------------
-# 4. Main
+# 4. Reusable build entry point (used by main() and by app.py)
 # --------------------------------------------------------------------------
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train the churn model.")
-    parser.add_argument("--data", default=None, help="Path to a Telco churn CSV.")
-    parser.add_argument("--test-size", type=float, default=0.2)
-    args = parser.parse_args()
+def build_and_save(
+    data_path: str | None = None,
+    output_dir: Path | str = MODELS_DIR,
+    test_size: float = 0.2,
+    verbose: bool = True,
+):
+    """Clean -> split -> fit -> evaluate -> save.
 
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    Returns a 3-tuple ``(model, scaler, metadata)``:
 
-    df = clean(load_data(args.data))
+    * ``model``    - the fitted :class:`~sklearn.pipeline.Pipeline`
+                     (ColumnTransformer + XGBClassifier)
+    * ``scaler``   - the fitted numeric imputer/scaler pipeline
+    * ``metadata`` - dict with feature names, options, ranges and ROC-AUC
+
+    Kept side-effect free on import so app.py can call it to rebuild the
+    artifacts in-process when a saved pickle cannot be unpickled.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def log(msg: str) -> None:
+        if verbose:
+            print(msg)
+
+    df = clean(load_data(data_path))
 
     if "Churn" not in df.columns:
-        raise SystemExit("Target column 'Churn' is missing from the data.")
+        raise ValueError("Target column 'Churn' is missing from the data.")
 
     y = (df["Churn"].astype(str).str.strip().str.lower() == "yes").astype(int)
     X = df.drop(columns=["Churn"])
@@ -245,14 +262,14 @@ def main() -> None:
     num_cols = [c for c in NUMERIC if c in X.columns]
     leftover = [c for c in X.columns if c not in cat_cols + num_cols]
     if leftover:
-        print(f"[warn] ignoring unexpected columns: {leftover}")
+        log(f"[warn] ignoring unexpected columns: {leftover}")
         X = X.drop(columns=leftover)
 
-    print(f"[data] {X.shape[0]} rows | {len(num_cols)} numeric, {len(cat_cols)} categorical")
-    print(f"[data] churn rate: {y.mean():.1%}")
+    log(f"[data] {X.shape[0]} rows | {len(num_cols)} numeric, {len(cat_cols)} categorical")
+    log(f"[data] churn rate: {y.mean():.1%}")
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, random_state=RANDOM_STATE, stratify=y
+        X, y, test_size=test_size, random_state=RANDOM_STATE, stratify=y
     )
 
     preprocessor = build_preprocessor(cat_cols, num_cols)
@@ -283,21 +300,25 @@ def main() -> None:
         ]
     )
 
-    print("\n[train] fitting XGBoost...")
+    log("\n[train] fitting XGBoost...")
     model.fit(X_train, y_train)
 
     y_pred = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
     auc = roc_auc_score(y_test, y_proba)
 
-    print("\n" + "=" * 62)
-    print("CLASSIFICATION REPORT (hold-out test set)")
-    print("=" * 62)
-    print(classification_report(y_test, y_pred, target_names=["No Churn", "Churn"], digits=4))
-    print("Confusion matrix [[TN FP] [FN TP]]:")
-    print(confusion_matrix(y_test, y_pred))
-    print(f"\nROC-AUC: {auc:.4f}")
-    print("=" * 62)
+    log("\n" + "=" * 62)
+    log("CLASSIFICATION REPORT (hold-out test set)")
+    log("=" * 62)
+    log(
+        classification_report(
+            y_test, y_pred, target_names=["No Churn", "Churn"], digits=4
+        )
+    )
+    log("Confusion matrix [[TN FP] [FN TP]]:")
+    log(str(confusion_matrix(y_test, y_pred)))
+    log(f"\nROC-AUC: {auc:.4f}")
+    log("=" * 62)
 
     # Feature names after the ColumnTransformer, for the Streamlit app.
     feature_names = list(model.named_steps["preprocessor"].get_feature_names_out())
@@ -311,35 +332,47 @@ def main() -> None:
     )
     scaler.fit(X_train[num_cols])
 
-    joblib.dump(model, MODELS_DIR / "churn_model.joblib")
-    joblib.dump(scaler, MODELS_DIR / "scaler.joblib")
+    metadata = {
+        "feature_names": feature_names,
+        "numeric_features": num_cols,
+        "categorical_features": cat_cols,
+        "roc_auc": round(float(auc), 4),
+        "options": {c: sorted(df[c].astype(str).unique().tolist()) for c in cat_cols},
+        "ranges": {
+            c: {
+                "min": float(df[c].min()),
+                "max": float(df[c].max()),
+                "median": float(df[c].median()),
+            }
+            for c in num_cols
+        },
+    }
 
-    with open(MODELS_DIR / "feature_metadata.json", "w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "feature_names": feature_names,
-                "numeric_features": num_cols,
-                "categorical_features": cat_cols,
-                "roc_auc": round(float(auc), 4),
-                "options": {
-                    c: sorted(df[c].astype(str).unique().tolist()) for c in cat_cols
-                },
-                "ranges": {
-                    c: {
-                        "min": float(df[c].min()),
-                        "max": float(df[c].max()),
-                        "median": float(df[c].median()),
-                    }
-                    for c in num_cols
-                },
-            },
-            fh,
-            indent=2,
-        )
+    joblib.dump(model, output_dir / "churn_model.joblib")
+    joblib.dump(scaler, output_dir / "scaler.joblib")
+    with open(output_dir / "feature_metadata.json", "w", encoding="utf-8") as fh:
+        json.dump(metadata, fh, indent=2)
 
-    print(f"\n[save] model      -> {MODELS_DIR / 'churn_model.joblib'}")
-    print(f"[save] scaler     -> {MODELS_DIR / 'scaler.joblib'}")
-    print(f"[save] metadata   -> {MODELS_DIR / 'feature_metadata.json'}")
+    log(f"\n[save] model      -> {output_dir / 'churn_model.joblib'}")
+    log(f"[save] scaler     -> {output_dir / 'scaler.joblib'}")
+    log(f"[save] metadata   -> {output_dir / 'feature_metadata.json'}")
+
+    return model, scaler, metadata
+
+
+# --------------------------------------------------------------------------
+# 5. CLI
+# --------------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train the churn model.")
+    parser.add_argument("--data", default=None, help="Path to a Telco churn CSV.")
+    parser.add_argument("--test-size", type=float, default=0.2)
+    args = parser.parse_args()
+
+    model, scaler, metadata = build_and_save(
+        data_path=args.data, test_size=args.test_size
+    )
+    return model, scaler, metadata
 
 
 if __name__ == "__main__":
