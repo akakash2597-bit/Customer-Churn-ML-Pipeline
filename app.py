@@ -66,11 +66,16 @@ FALLBACK_RANGES = {
 
 @st.cache_resource(show_spinner=False)
 def train_model():
-    """Train the pipeline live, in memory, by calling train.build_and_save().
+    """Train the pipeline once, in memory, via train.build_and_save().
 
-    Nothing is unpickled: the model is rebuilt from the raw data every time the
-    app starts, so a stale or incompatible artifact on disk can never break the
-    dashboard. The call still refreshes models/, keeping those files current.
+    The @st.cache_resource decorator above caches the return value for the life
+    of the server process, so the 400-tree fit runs on the first page load only.
+    Every later rerun, widget interaction and browser session gets the cached
+    pipeline back instead of retraining.
+
+    Nothing is unpickled: the model is built from the raw data with the versions
+    installed here, so a stale or incompatible artifact on disk can never break
+    the dashboard. The call still refreshes models/, keeping those files current.
 
     Returns (model, scaler, metadata, notice). ``notice`` describes the outcome
     of the training run, or why it could not be completed.
@@ -139,6 +144,8 @@ def per_customer_contributions(clf, row_matrix: np.ndarray, n_features: int) -> 
 
 
 # ------------------------------------------------------------ sidebar ---
+# train_model() is @st.cache_resource'd: the first load fits the model, every
+# later rerun and session reuses that same in-memory pipeline.
 with st.spinner("Training the churn model..."):
     model, scaler, meta, load_notice = train_model()
 
